@@ -6,7 +6,7 @@ This module allows enumerating Active Directory Certificate Services (AD CS) com
 - Certificate authorities
 - Certificate issuance policies
 - Security permissions and ACLs
-- Vulnerability detection for ESC1-15
+- Vulnerability detection for ESC1-17
 
 It provides detailed information about certificate templates, authorities, and security
 settings, helping identify misconfiguration and potential attack vectors.
@@ -53,6 +53,7 @@ from certipy.lib.security import (
     IssuancePolicySecurity,
     is_admin_sid,
 )
+from certipy.lib.structs import IntFlag
 from certipy.lib.target import Target
 from certipy.lib.time import filetime_to_str
 
@@ -518,6 +519,7 @@ class Find:
             enforce_encrypt_icertrequest = "Unknown"
             disabled_extensions = "Unknown"
             security = None
+            enrollment_agent_restrictions = None
 
             if ca_configuration is not None:
                 active_policy = ca_configuration.active_policy
@@ -548,6 +550,10 @@ class Find:
 
                 security = ca_configuration.security
 
+                enrollment_agent_restrictions = (
+                    ca_configuration.enrollment_agent_restrictions
+                )
+
             # Update properties
             ca_properties.update(
                 {
@@ -557,6 +563,7 @@ class Find:
                     "enforce_encrypt_icertrequest": enforce_encrypt_icertrequest,
                     "disabled_extensions": disabled_extensions,
                     "security": security,
+                    "enrollment_agent_restrictions": enrollment_agent_restrictions,
                 }
             )
 
@@ -940,6 +947,12 @@ class Find:
         )
         template.set("client_authentication", client_authentication)
 
+        # Check for server authentication capability
+        server_authentication = (
+            "Server Authentication" in extended_key_usage or any_purpose
+        )
+        template.set("server_authentication", server_authentication)
+
         # Check for enrollment agent capability
         enrollment_agent = (
             any_purpose or "Certificate Request Agent" in extended_key_usage
@@ -1027,9 +1040,20 @@ class Find:
             output_path = f"{prefix}_Certipy.json"
             logging.info(f"Saving JSON output to {output_path!r}")
 
+            def prepare_for_json(obj: Any):
+                if isinstance(obj, dict):
+                    return {k: prepare_for_json(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple, set)):
+                    return [prepare_for_json(v) for v in obj]
+                elif isinstance(obj, IntFlag):
+                    return str(obj)
+                return obj
+
+            output_json = prepare_for_json(output)
+
             f = io.StringIO()
             json.dump(
-                output,
+                output_json,
                 f,
                 indent=2,
                 default=str,
@@ -1124,6 +1148,24 @@ class Find:
             # Create entry with properties and permissions
             entry = OrderedDict()
             entry = self.get_ca_properties(ca, entry)
+
+            # Add Enrollment Agent Restrictions if present
+            ea_restrictions = ca.get("enrollment_agent_restrictions")
+            if ea_restrictions is not None:
+                restrictions_output = OrderedDict()
+                for restriction in ea_restrictions:
+                    agent_name = self.connection.lookup_sid(restriction.agent).get(
+                        "name"
+                    )
+                    target_names = [
+                        self.connection.lookup_sid(t).get("name")
+                        for t in restriction.targets
+                    ]
+                    restrictions_output[agent_name] = {
+                        "Template": restriction.template,
+                        "Targets": target_names if target_names else ["<All>"],
+                    }
+                entry["Enrollment Agent Restrictions"] = restrictions_output
 
             # Add permissions
             permissions = self.get_ca_permissions(ca)
@@ -1918,6 +1960,7 @@ class Find:
         - ESC9: Template with no security extension
         - ESC13: Template linked to a group through issuance policy
         - ESC15: Schema v1 template with enrollee-supplied subject (CVE-2024-49019)
+        - ESC17: Server authentication template with enrollee-supplied subject
 
         Args:
             template: Certificate template to analyze
@@ -2030,6 +2073,19 @@ class Find:
                     remarks["ESC15"] = (
                         "Only applicable if the environment has not been patched. "
                         "See CVE-2024-49019 or the wiki for more details."
+                    )
+
+                # ESC17: Server authentication with enrollee-supplied subject
+                if template.get("enrollee_supplies_subject") and template.get(
+                    "server_authentication"
+                ):
+                    vulnerabilities["ESC17"] = (
+                        f"Enrollee supplies subject "
+                        "and template allows server authentication."
+                    )
+                    remarks["ESC17"] = (
+                        "Other prerequisites may be required for this to be exploitable. See "
+                        "the wiki for more details."
                     )
 
             # ESC2 Target: Schema v1 or requires Any Purpose signature
